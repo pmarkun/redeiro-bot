@@ -1,12 +1,15 @@
 import os
+import asyncio
 import discord
 import openai
+import whisper
 
 from discord.ext import commands
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+model = whisper.load_model("medium")
 
 # Set up GPT-4 API credentials
 openai.api_key = os.getenv("GPT4_API_KEY")
@@ -51,6 +54,15 @@ async def query_gpt4(messages):
 
     return response['choices'][0]['message']['content'].strip()
 
+def transcribe_audio_file(audio_file_path: str) -> str:
+    result = model.transcribe(audio_file_path)
+    return result["text"]
+
+async def transcribe_audio_file_async(audio_file_path: str) -> str:
+    loop = asyncio.get_event_loop()
+    transcription = await loop.run_in_executor(None, transcribe_audio_file, audio_file_path)
+    return transcription
+
 @bot.event
 async def on_ready():
     print("Bot is ready.")
@@ -60,10 +72,31 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    if bot.user in message.mentions:
-        ctx = await bot.get_context(message)
-        query = message.content.strip()
+    ctx = await bot.get_context(message)
+
+    if message.content.startswith('!ask') or bot.user in message.mentions:
+        query = message.content.lstrip('!ask').strip()
         await process_query(ctx, query)
+
+    # Check if an audio file is attached to the message
+    if message.attachments:
+        attachment = message.attachments[0]
+        if attachment.content_type.startswith("audio/"):
+            # Answer
+            await message.channel.send("Opa, parece que você mandou um audio. Deixa eu só escutar aqui e já retorno...", reference=message)
+            # Download the audio file
+            audio_file_path = f"./temp_audio/{attachment.filename}"
+            await attachment.save(audio_file_path)
+
+            # Transcribe the audio file
+            transcription = await transcribe_audio_file_async(audio_file_path)
+
+            # Remove the temporary audio file
+            os.remove(audio_file_path)
+
+            # Process the transcribed audio query
+            await process_audio_query(ctx, transcription, reply=message)
+
     await bot.process_commands(message)
 
 @bot.command()
@@ -80,6 +113,23 @@ async def persona(ctx, *, new_persona=None):
     else:
         await ctx.send(f"Current persona: {current_persona}")
 
+
+async def process_audio_query(ctx, transcription, reply=None):
+    system_message_content = "Você acabou de receber essa transcrição de um audio e deve responder com suas considerações pessoais sobre o assunto."
+    context = f"{current_persona}\n{system_message_content}"
+
+    system_message = {"role": "system", "content": context}
+    user_message = {"role": "user", "content": transcription}
+
+    messages = [system_message, user_message]
+
+    async with ctx.typing():
+        response = await query_gpt4(messages)
+    
+    if reply:
+        await reply.channel.send(response, reference=reply)
+    else:
+        await ctx.send(response)
 
 async def process_query(ctx, query):
     chat_history = await fetch_chat_history(ctx.channel, 10)
